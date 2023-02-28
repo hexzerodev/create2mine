@@ -1,5 +1,6 @@
 use fs2::FileExt;
 use hex::FromHex;
+use itertools::Itertools;
 use rand::{distributions::Standard, thread_rng, Rng};
 use rayon::prelude::*;
 use std::fs::OpenOptions;
@@ -182,33 +183,35 @@ pub fn run(config: Config) {
         array
     };
 
+    // create new hash object
+    let mut hash_header = Keccak::v256();
+
+    // hash to derive address
+    hash_header.update(&header);
+
+    // iterate over salt incrementally
     (0..MAX_INCREMENTER)
         .into_par_iter()
         .map(|x| u64_to_fixed_6(&x))
         .for_each(|salt_incremented_segment| {
             // calculate address
-            let address_bytes: [u8; 20] = {
-                // create new hash object
-                let mut hash = Keccak::v256();
+            let hash_res: [u8; 32] = {
+                // clone the partially-hashed object
+                let mut hash = hash_header.clone();
 
-                // hash to derive address
-                hash.update(&header);
                 hash.update(&salt_incremented_segment);
                 hash.update(&footer);
 
                 let mut res: [u8; 32] = [0; 32];
                 hash.finalize(&mut res);
 
-                // truncate the first 12 bytes from the hash to derive the address
-                let mut address_bytes: [u8; 20] = Default::default();
-                address_bytes.copy_from_slice(&res[12..]);
-
-                address_bytes
+                res
             };
 
             // get zero bytes count
-            let zero_bytes_count = address_bytes
+            let zero_bytes_count = hash_res
                 .iter()
+                .dropping(12)
                 .filter(|&n| *n == ZERO_CHARACTER)
                 .count();
 
@@ -220,7 +223,7 @@ pub fn run(config: Config) {
             // calculate leading zeros
             let leading_zero_count = {
                 let mut c = 0;
-                for (i, b) in address_bytes.iter().enumerate() {
+                for (i, b) in hash_res.iter().dropping(12).enumerate() {
                     if *b != ZERO_CHARACTER {
                         c = i;
                         break;
@@ -233,6 +236,14 @@ pub fn run(config: Config) {
             if leading_zero_count < 4 {
                 return;
             }
+
+            // truncate the first 12 bytes from the hash to derive the address
+            let address_bytes = {
+                let mut address_bytes: [u8; 20] = Default::default();
+                address_bytes.copy_from_slice(&hash_res[12..]);
+
+                address_bytes
+            };
 
             // get address
             let address = {
