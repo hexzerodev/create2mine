@@ -8,5 +8,9 @@ fn main() {
         process::exit(1);
     });
 
-    create2mine::run(config);
+    // create2mine::run(config);
+    create2mine::gpu(config).unwrap_or_else(|err| {
+        eprintln!("Failed to mine: {}", err);
+        process::exit(1);
+    });
 }
