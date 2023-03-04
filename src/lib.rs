@@ -4,6 +4,7 @@ use fs2::FileExt;
 use hex::FromHex;
 use itertools::Itertools;
 use ocl::DeviceType;
+use rand::RngCore;
 use rand::{distributions::Standard, thread_rng, Rng};
 use rayon::prelude::*;
 use separator::Separatable;
@@ -25,8 +26,6 @@ const EIGHT_ZERO_BYTES: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 const ZERO_BYTE: u8 = 0x00;
 
 const WORK_SIZE: usize = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
-
-const INTERVAL: u64 = 0x100000000;
 
 /* -------------------------------------------------------------------------- */
 /*                                   config                                   */
@@ -436,12 +435,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         "\n--------------------------------------------------------------------------------\n"
     );
 
-    //
-    // _add()?;
-    // _reduction()?;
-    // _reduction_vector()?;
     _mint(config)?;
-    // _t()?;
 
     return Ok(());
 }
@@ -458,8 +452,11 @@ fn _mint(config: Config) -> ocl::Result<()> {
     let caller: [u8; 20] = config.calling_address;
     let init_hash: [u8; 32] = config.init_code_hash;
 
+    let min_leading_zero_count = config.min_leading_zeroes;
+    let min_zero_bytes_count = config.min_zeroes_count;
+
     let term = Term::stdout();
-    let rng = thread_rng();
+    let mut rng = thread_rng();
 
     let start_time: f64 = time::SystemTime::now()
         .duration_since(time::UNIX_EPOCH)
@@ -473,8 +470,8 @@ fn _mint(config: Config) -> ocl::Result<()> {
     let mut found: u64 = 0;
     let mut found_list: Vec<String> = vec![];
 
-    let min_leading_zero_count = config.min_leading_zeroes;
-    let min_zero_bytes_count = config.min_zeroes_count;
+    let mut previous_time: f64 = 0.0;
+    let mut work_duration_millis: u64 = 0;
 
     // platform, devices
     let platform = ocl::Platform::default();
@@ -499,10 +496,34 @@ fn _mint(config: Config) -> ocl::Result<()> {
     let context = ocl::Context::builder().devices(device.clone()).build()?;
     let queue = ocl::Queue::new(&context, device, None)?;
 
+    // kernel
+    // generate the kernel source code with the define macros
+    let kernel_src = &format!(
+        "{}\n{}\n{}\n#define LEADING_ZEROES {}\n#define TOTAL_ZEROES {}\n{}",
+        factory
+            .iter()
+            .enumerate()
+            .map(|(i, x)| format!("#define S_{} {}u\n", i + 1, x))
+            .collect::<String>(),
+        caller
+            .iter()
+            .enumerate()
+            .map(|(i, x)| format!("#define S_{} {}u\n", i + 21, x))
+            .collect::<String>(),
+        init_hash
+            .iter()
+            .enumerate()
+            .map(|(i, x)| format!("#define S_{} {}u\n", i + 53, x))
+            .collect::<String>(),
+        config.min_leading_zeroes,
+        config.min_zeroes_count,
+        EFFICIENT_ADDRESS_CL_SRC
+    );
+
     // program
     let program = ocl::Program::builder()
         .devices(device)
-        .src(EFFICIENT_ADDRESS_CL_SRC)
+        .src(kernel_src)
         .build(&context)?;
 
     //
@@ -514,16 +535,10 @@ fn _mint(config: Config) -> ocl::Result<()> {
             .sample_iter(Standard)
             .take(4)
             .collect::<Vec<u8>>();
-        let message_buffer = {
-            let mut message_vec = vec![CONTROL_CHARACTERS];
-            message_vec.extend(factory.iter());
-            message_vec.extend(caller.iter());
-            message_vec.extend(&salt);
-            message_vec.extend(EIGHT_ZERO_BYTES.iter());
-            message_vec.extend(init_hash.iter());
-            let message: [u8; 85] = to_fixed_85(&message_vec);
 
-            // build a corresponding buffer for passing the message to the kernel
+        let message_buffer = {
+            let message: [u8; 4] = to_fixed_4(&salt);
+
             let buffer = ocl::Buffer::builder()
                 .queue(queue.clone())
                 .flags(ocl::flags::MEM_READ_ONLY)
@@ -534,19 +549,8 @@ fn _mint(config: Config) -> ocl::Result<()> {
             buffer
         };
 
-        let target: [u8; 2] = [min_leading_zero_count, min_zero_bytes_count];
-        let target_buffer = {
-            let buffer = ocl::Buffer::builder()
-                .queue(queue.clone())
-                .flags(ocl::flags::MEM_READ_ONLY)
-                .len(target.len())
-                .copy_host_slice(&target)
-                .build()?;
-
-            buffer
-        };
-
-        let mut nonce: [u64; 1] = [0];
+        // reset nonce
+        let mut nonce: [u32; 1] = [rng.next_u32()];
         let mut nonce_buffer = {
             let buffer = ocl::Buffer::builder()
                 .queue(queue.clone())
@@ -559,7 +563,7 @@ fn _mint(config: Config) -> ocl::Result<()> {
         };
 
         // output
-        let mut solutions: Vec<u64> = vec![0; 256];
+        let mut solutions: Vec<u64> = vec![0; 1];
         let solutions_buffer = {
             let buffer = ocl::Buffer::builder()
                 .queue(queue.clone())
@@ -571,93 +575,8 @@ fn _mint(config: Config) -> ocl::Result<()> {
             buffer
         };
 
-        let mut solution_count: Vec<u32> = vec![0];
-        let solution_count_buffer = {
-            let buffer = ocl::Buffer::builder()
-                .queue(queue.clone())
-                .flags(ocl::flags::MEM_WRITE_ONLY)
-                .len(1)
-                .fill_val(0u32)
-                .build()?;
-            buffer
-        };
-
         // run kernel, incrementing nonce
         loop {
-            // term display
-            {
-                // clear the terminal screen
-                term.clear_screen()?;
-
-                // calculate the current time
-                let current_time: f64 = time::SystemTime::now()
-                    .duration_since(time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as f64;
-
-                // get the total runtime and parse into hours : minutes : seconds
-                let total_runtime = current_time - start_time;
-                let total_runtime_hrs = *&total_runtime as u64 / (3600);
-                let total_runtime_mins = (*&total_runtime as u64 - &total_runtime_hrs * 3600) / 60;
-                let total_runtime_secs = &total_runtime
-                    - (&total_runtime_hrs * 3600) as f64
-                    - (&total_runtime_mins * 60) as f64;
-
-                // determine the number of attempts being made per second
-                if total_runtime > 0.0 {
-                    rate = 1.0 / total_runtime;
-                }
-                let work_rate: f64 =
-                    (((WORK_SIZE as u128 / 1_000_000) * (cumulative_nonce as u128)) as f64) * rate;
-
-                // fill the buffer for viewing the properly-formatted nonce
-                byteorder::LittleEndian::write_u64(&mut view_buf, nonce[0]);
-
-                // calculate the terminal height, defaulting to a height of ten rows
-                let size = terminal_size::terminal_size();
-                let height: u16;
-                if let Some((terminal_size::Width(_w), terminal_size::Height(h))) = size {
-                    height = h;
-                } else {
-                    height = 10;
-                }
-
-                // display information about the total runtime and work size
-                term.write_line(&format!(
-                    "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
-              work size per cycle: {}",
-                    total_runtime_hrs,
-                    total_runtime_mins,
-                    total_runtime_secs,
-                    cumulative_nonce,
-                    WORK_SIZE.separated_string()
-                ))?;
-
-                // display information about the attempt rate and found solutions
-                term.write_line(&format!(
-                    "rate: {:.2} million attempts per second\t\t\t\
-              total found this run: {}",
-                    work_rate, &found
-                ))?;
-
-                // display information about the current search criteria
-                term.write_line(&format!(
-                    "current search space: {}xxxxxxxx{:08x}\t\t\
-              threshold: {} leading or {} total zeroes",
-                    hex::encode(&salt),
-                    byteorder::BigEndian::read_u64(&view_buf),
-                    target[0],
-                    target[1]
-                ))?;
-
-                // display recently found solutions based on terminal height
-                let rows: usize = if height < 5 { 1 } else { (height - 4) as usize };
-                let last_rows: Vec<String> = found_list.iter().cloned().rev().take(rows).collect();
-                let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
-                let recently_found = &ordered.join("\n");
-                term.write_line(&recently_found)?;
-            }
-
             // run kernel
             {
                 // build kernel
@@ -665,10 +584,8 @@ fn _mint(config: Config) -> ocl::Result<()> {
                     .program(&program)
                     .name("hashMessage")
                     .arg(&message_buffer)
-                    .arg(&target_buffer)
                     .arg(&nonce_buffer)
                     .arg(&solutions_buffer)
-                    .arg(&solution_count_buffer)
                     .build()?;
 
                 // enqueue kernel
@@ -682,15 +599,116 @@ fn _mint(config: Config) -> ocl::Result<()> {
                 }
             }
 
+            let mut now = time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap();
+
+            // term display
+            {
+                // calculate the current time
+                let current_time: f64 = now.as_secs() as f64;
+
+                // prevent printing too fast
+                let print_output: bool = current_time - previous_time > 0.99;
+                previous_time = current_time;
+
+                if print_output {
+                    // clear the terminal screen
+                    term.clear_screen()?;
+
+                    // get the total runtime and parse into hours : minutes : seconds
+                    let total_runtime = current_time - start_time;
+                    let total_runtime_hrs = *&total_runtime as u64 / (3600);
+                    let total_runtime_mins =
+                        (*&total_runtime as u64 - &total_runtime_hrs * 3600) / 60;
+                    let total_runtime_secs = &total_runtime
+                        - (&total_runtime_hrs * 3600) as f64
+                        - (&total_runtime_mins * 60) as f64;
+
+                    // determine the number of attempts being made per second
+                    if total_runtime > 0.0 {
+                        rate = 1.0 / total_runtime;
+                    }
+                    let work_rate: f64 =
+                        (((WORK_SIZE as u128 / 1_000_000) * (cumulative_nonce as u128)) as f64)
+                            * rate;
+
+                    // fill the buffer for viewing the properly-formatted nonce
+                    byteorder::LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
+
+                    // calculate the terminal height, defaulting to a height of ten rows
+                    let size = terminal_size::terminal_size();
+                    let height: u16;
+                    if let Some((terminal_size::Width(_w), terminal_size::Height(h))) = size {
+                        height = h;
+                    } else {
+                        height = 10;
+                    }
+
+                    // display information about the total runtime and work size
+                    term.write_line(&format!(
+                        "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
+              work size per cycle: {}",
+                        total_runtime_hrs,
+                        total_runtime_mins,
+                        total_runtime_secs,
+                        cumulative_nonce,
+                        WORK_SIZE.separated_string()
+                    ))?;
+
+                    // display information about the attempt rate and found solutions
+                    term.write_line(&format!(
+                        "rate: {:.2} million attempts per second\t\t\t\
+              total found this run: {}",
+                        work_rate, &found
+                    ))?;
+
+                    // display information about the current search criteria
+                    term.write_line(&format!(
+                        "current search space: {}xxxxxxxx{:08x}\t\t\
+              threshold: {} leading or {} total zeroes",
+                        hex::encode(&salt),
+                        byteorder::BigEndian::read_u64(&view_buf),
+                        min_leading_zero_count,
+                        min_zero_bytes_count
+                    ))?;
+
+                    // display recently found solutions based on terminal height
+                    let rows: usize = if height < 5 { 1 } else { (height - 4) as usize };
+                    let last_rows: Vec<String> =
+                        found_list.iter().cloned().rev().take(rows).collect();
+                    let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
+                    let recently_found = &ordered.join("\n");
+                    term.write_line(&recently_found)?;
+                }
+            }
+
             cumulative_nonce += 1;
+
+            // record the start time of the work
+            let work_start_time_millis = now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000;
+
+            // sleep for 50% of the previous work duration to conserve CPU
+            if work_duration_millis != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    work_duration_millis * 50 / 1000,
+                ));
+            }
 
             // read output
             {
-                // read the number of solutions from the device
-                solution_count_buffer.read(&mut solution_count).enq()?;
+                // read the solutions from the device
+                solutions_buffer.read(&mut solutions).enq()?;
+
+                // record the end time of the work and compute how long the work took
+                now = time::SystemTime::now()
+                    .duration_since(time::UNIX_EPOCH)
+                    .unwrap();
+                work_duration_millis = (now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000)
+                    - work_start_time_millis;
 
                 // if at least one solution is found, end the loop
-                if solution_count[0] != 0 {
+                if solutions[0] != 0 {
                     break;
                 }
             }
@@ -698,7 +716,7 @@ fn _mint(config: Config) -> ocl::Result<()> {
             // next loop
             {
                 // if no solution has yet been found, increment the nonce
-                nonce[0] += INTERVAL as u64;
+                nonce[0] += 1;
 
                 // update the nonce buffer with the incremented nonce value
                 nonce_buffer = {
@@ -815,10 +833,10 @@ fn u64_to_le_fixed_8(x: &u64) -> [u8; 8] {
 }
 
 /**
- * Convert a properly-sized vector to a fixed array of 85 bytes.
+ * Convert a properly-sized vector to a fixed array of 4 bytes.
  */
-fn to_fixed_85(bytes: &std::vec::Vec<u8>) -> [u8; 85] {
-    let mut array = [0; 85];
+fn to_fixed_4(bytes: &std::vec::Vec<u8>) -> [u8; 4] {
+    let mut array = [0; 4];
     let bytes = &bytes[..array.len()];
     array.copy_from_slice(bytes);
     array
